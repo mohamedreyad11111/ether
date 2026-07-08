@@ -6,5 +6,5 @@ edition = "2021"
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.11", features = ["json"] }
-ethers = { version = "2.0.14", features = ["ws", "macros"] }
+ethers = { version = "2.0.14", features = ["ws", "abigen"] }
 eyre = "0.6"
