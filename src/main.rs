@@ -5,7 +5,6 @@ use eyre::Result;
 const POOL_A: &str = "0xd0b53D9277642d899DF5C87A3966A349A798F224";
 const POOL_B: &str = "0x6a77CDeC82EFf6A6A5D273F18C1c27CD3d71A588";
 
-// توليد أنواع الأحداث يدوياً عبر الماكرو
 abigen!(
     IUniswapV2Pair,
     r#"[
@@ -35,8 +34,8 @@ async fn main() -> Result<()> {
     let mut stream = client.subscribe_logs(&filter).await?;
 
     while let Some(log) = stream.next().await {
-        // التعديل هنا: استخدام SyncFilter المولد من الماكرو مباشرة
-        if let Ok(sync_event) = SyncFilter::decode_log(&log.into()) {
+        // فك التشفير الدقيق لتفادي غموض الـ Trait
+        if let Ok(sync_event) = <SyncFilter as EthEvent>::decode_log(&log.into()) {
             let r0 = sync_event.reserve_0 as f64;
             let r1 = sync_event.reserve_1 as f64;
             
