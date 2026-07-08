@@ -1,45 +1,86 @@
 use reqwest::Client;
 use serde_json::Value;
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::time::interval;
+use tokio::sync::RwLock;
+
+// 1. هيكل الذاكرة المشتركة لتخزين الأسعار الحالية بين الخيوط المتوازية
+#[derive(Default)]
+struct MarketData {
+    // يخزن السعر كنسبة تحويل (مثلاً: 1 WETH = 1730.5 USDC)
+    rates: HashMap<String, f64>,
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("🚀 [Init]: بدء اختبار 0x API بمعدل 2 طلب/ثانية لمدة 10 دقائق (1,200 طلب)...");
+    println!("🚀 [Init]: تشغيل 3 Workers متوازية باقتناص مستمر للأسعار والبحث عن الفرص العكسية...\n");
 
     let client = Client::builder()
-        .timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(4))
         .build()?;
 
+    // ذاكرة مشتركة محمية وقابلة للقراءة/الكتابة بين جميع الخيوط
+    let market_state = Arc::new(RwLock::new(MarketData::default()));
+
+    // إعداد أزواج التداول (Direct & Reverse)
+    let weth = "0x4200000000000000000000000000000000000006";
+    let usdc = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
+    let wbtc = "0x0555E30da8f98308EdB960aa94C0Db47230d2B9c";
+
+    // 🧵 Worker 1: WETH -> USDC (Direct)
+    let client1 = client.clone();
+    let state1 = Arc::clone(&market_state);
+    let task1 = tokio::spawn(async move {
+        fetch_tight_loop(client1, state1, 1, weth, usdc, "1000000000000000000", "WETH_USDC", 1e18, 1e6).await;
+    });
+
+    // 🧵 Worker 2: USDC -> WETH (Reverse)
+    let client2 = client.clone();
+    let state2 = Arc::clone(&market_state);
+    let task2 = tokio::spawn(async move {
+        fetch_tight_loop(client2, state2, 2, usdc, weth, "2000000000", "USDC_WETH", 1e6, 1e18).await;
+    });
+
+    // 🧵 Worker 3: WETH -> WBTC (Alternative Route)
+    let client3 = client.clone();
+    let state3 = Arc::clone(&market_state);
+    let task3 = tokio::spawn(async move {
+        fetch_tight_loop(client3, state3, 3, weth, wbtc, "1000000000000000000", "WETH_WBTC", 1e18, 1e8).await;
+    });
+
+    // انتظار تشغيل المهام المتوازية معاً
+    let _ = tokio::join!(task1, task2, task3);
+
+    Ok(())
+}
+
+/// دالة تنفيذ الطلبات اللحظية المتتالية (Tight Loop) بدون أي انتظار زمني
+async fn fetch_tight_loop(
+    client: Client,
+    state: Arc<RwLock<MarketData>>,
+    worker_id: u8,
+    sell_token: &'static str,
+    buy_token: &'static str,
+    amount: &'static str,
+    pair_name: &'static str,
+    sell_decimals: f64,
+    buy_decimals: f64,
+) {
     let url = "https://api.0x.org/swap/allowance-holder/price";
-    let params = [
-        ("chainId", "8453"),
-        ("sellToken", "0x4200000000000000000000000000000000000006"), // WETH
-        ("buyToken", "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"),  // USDC
-        ("sellAmount", "1000000000000000000"),                     // 1 WETH
-    ];
     let api_key = "33496247-f998-476f-bc8e-34779b69bd87";
+    let mut request_counter = 0;
 
-    // إعداد مؤقت ينطلق كل 500 مللي ثانية (2 طلب في الثانية)
-    let mut ticker = interval(Duration::from_millis(500));
-
-    // 2 طلب/ثانية * 600 ثانية = 1200 طلب
-    let total_target_requests = 1200;
-
-    let mut total_requests = 0;
-    let mut success_count = 0;
-    let mut rate_limit_count = 0;
-    let mut error_count = 0;
-
-    let mut latencies_ms: Vec<f64> = Vec::new();
-    let start_total_time = Instant::now();
-
-    while total_requests < total_target_requests {
-        // الانتظار حتى يحين وقت الطلب القادم
-        ticker.tick().await;
-
-        total_requests += 1;
+    loop {
+        request_counter += 1;
         let req_start = Instant::now();
+
+        let params = [
+            ("chainId", "8453"),
+            ("sellToken", sell_token),
+            ("buyToken", buy_token),
+            ("sellAmount", amount),
+        ];
 
         match client
             .get(url)
@@ -50,79 +91,67 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await
         {
             Ok(response) => {
-                let status = response.status();
                 let latency = req_start.elapsed().as_secs_f64() * 1000.0;
+                let status = response.status();
 
                 if status.is_success() {
                     if let Ok(body_text) = response.text().await {
-                        latencies_ms.push(latency);
-                        success_count += 1;
-
-                        // استخراج السعر المرتجع لـ 1 WETH باستخدام Turbofish syntax ::<Value>
                         if let Ok(json) = serde_json::from_str::<Value>(&body_text) {
-                            let buy_amount = json["buyAmount"].as_str().unwrap_or("0");
-                            let buy_usdc = buy_amount.parse::<f64>().unwrap_or(0.0) / 1_000_000.0;
+                            let buy_amount_str = json["buyAmount"].as_str().unwrap_or("0");
+                            let buy_amount = buy_amount_str.parse::<f64>().unwrap_or(0.0);
+                            let sell_amount = amount.parse::<f64>().unwrap_or(1.0);
+
+                            // حساب سعر الوحدة الحقيقي
+                            let rate = (buy_amount / buy_decimals) / (sell_amount / sell_decimals);
 
                             println!(
-                                "req #{:04}/{}: ✅ 200 OK | Latency: {:.2} ms | 1 WETH = {:.2} USDC",
-                                total_requests, total_target_requests, latency, buy_usdc
+                                "⚡ [Worker {} | #{:04}]: {} | Latency: {:.1} ms | Rate: {:.6}",
+                                worker_id, request_counter, pair_name, latency, rate
                             );
-                        } else {
-                            println!(
-                                "req #{:04}/{}: ✅ 200 OK | Latency: {:.2} ms",
-                                total_requests, total_target_requests, latency
-                            );
+
+                            // 1. تحديث السعر في الذاكرة المشتركة
+                            {
+                                let mut lock = state.write().await;
+                                lock.rates.insert(pair_name.to_string(), rate);
+                            }
+
+                            // 2. فحص وجود فرصة عكسية فوراً (Arbitrage Detection)
+                            check_reverse_arbitrage(&state, pair_name).await;
                         }
                     }
                 } else if status.as_u16() == 429 {
-                    rate_limit_count += 1;
-                    println!(
-                        "req #{:04}/{}: ⚠️ 429 Rate Limit Exceeded | Latency: {:.2} ms",
-                        total_requests, total_target_requests, latency
-                    );
-                } else {
-                    error_count += 1;
-                    println!(
-                        "req #{:04}/{}: ❌ Status Error: {} | Latency: {:.2} ms",
-                        total_requests, total_target_requests, status, latency
-                    );
+                    println!("⚠️ [Worker {}]: Rate Limit 429! نوم مؤقت 500ms...", worker_id);
+                    tokio::time::sleep(Duration::from_millis(500)).await;
                 }
             }
-            Err(err) => {
-                error_count += 1;
-                println!(
-                    "req #{:04}/{}: 💥 Network/Timeout Error: {}",
-                    total_requests, total_target_requests, err
-                );
+            Err(e) => {
+                println!("❌ [Worker {}]: خطأ شبكة: {}", worker_id, e);
+                tokio::time::sleep(Duration::from_millis(200)).await;
             }
         }
     }
+}
 
-    // 📊 حساب الأحصائيات النهائية
-    let elapsed_total = start_total_time.elapsed().as_secs_f64();
-    let avg_latency = if !latencies_ms.is_empty() {
-        latencies_ms.iter().sum::<f64>() / latencies_ms.len() as f64
-    } else {
-        0.0
-    };
+/// دالة حساب ومقارنة الفرص العكسية بين الأوراق المالية في الذاكرة
+async fn check_reverse_arbitrage(state: &Arc<RwLock<MarketData>>, updated_pair: &str) {
+    let lock = state.read().await;
 
-    let min_latency = latencies_ms.iter().cloned().fold(f64::INFINITY, f64::min);
-    let max_latency = latencies_ms.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    // فحص الفرصة العكسية المباشرة بين WETH و USDC
+    if updated_pair == "WETH_USDC" || updated_pair == "USDC_WETH" {
+        if let (Some(&weth_to_usdc), Some(&usdc_to_weth)) = (
+            lock.rates.get("WETH_USDC"),
+            lock.rates.get("USDC_WETH"),
+        ) {
+            // المعامل العكسي: ضرب نسبة الذهاب في نسبة العودة
+            let return_factor = weth_to_usdc * usdc_to_weth;
+            let profit_percentage = (return_factor - 1.0) * 100.0;
 
-    println!("\n===========================================");
-    println!("📊 [التقرير النهائي للتجربة - 10 دقائق]");
-    println!("===========================================");
-    println!("⏱️  الوقت الإجمالي للتجربة: {:.2} ثانية", elapsed_total);
-    println!("📥  إجمالي الطلبات المرسلة: {}", total_requests);
-    println!("✅  الطلبات الناجحة: {}", success_count);
-    println!("⚠️  أخطاء تجاوز الحدود (429 Rate Limit): {}", rate_limit_count);
-    println!("❌  أخطاء الاتصال/السيرفر: {}", error_count);
-    println!("⚡  متوسط زمن الشبكة (Avg Latency): {:.2} ms", avg_latency);
-    if !latencies_ms.is_empty() {
-        println!("🏎️  أسرع طلب (Min Latency): {:.2} ms", min_latency);
-        println!("🐢  أبطأ طلب (Max Latency): {:.2} ms", max_latency);
+            if return_factor > 1.0 {
+                println!("\n🎯🎯🎯 [OPPORTUNITY DETECTED! / فرصة مراجحة عكسية] 🎯🎯🎯");
+                println!("   ▶ Direct (WETH -> USDC): {:.4}", weth_to_usdc);
+                println!("   ◀ Reverse (USDC -> WETH): {:.6}", usdc_to_weth);
+                println!("   💰 Return Factor: {:.6} | Net Profit: +{:.3}%\n", return_factor, profit_percentage);
+            }
+        }
     }
-    println!("===========================================\n");
-
-    Ok(())
 }
