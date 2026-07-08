@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use tokio::time::sleep;
 use eyre::Result;
 
-// 1. واجهات العقود الذكية للـ Factory، والـ Pair، والـ ERC20 لجلب الرموز (Symbols)
+// 1. واجهات العقود الذكية مع دعم String و Bytes32 للـ Symbol
 abigen!(
     IUniswapV2Factory,
     r#"[
@@ -21,13 +21,18 @@ abigen!(
         event Sync(uint112 reserve0, uint112 reserve1)
     ]"#;
 
-    IERC20,
+    IERC20String,
     r#"[
         function symbol() external view returns (string)
     ]"#;
+
+    IERC20Bytes32,
+    r#"[
+        function symbol() external view returns (bytes32)
+    ]"#;
 );
 
-// 2. هيكل الحوض مع رموز التوكنات (Symbols)
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct DynamicPool {
     id: usize,
@@ -42,7 +47,6 @@ struct DynamicPool {
 }
 
 impl DynamicPool {
-    // محاكاة معادلة صانع السوق الآلي مع خصم الرسوم
     fn get_amount_out(&self, amount_in: f64, from_token0: bool) -> f64 {
         if amount_in <= 0.0 { return 0.0; }
         
@@ -64,9 +68,28 @@ impl DynamicPool {
 
 const UNISWAP_V2_FACTORY_BASE: &str = "0x8909Dc15e40173Ff4699343b6eB8132c65e18eC6";
 
+// دالة مخصصة لجلب اسم الرمز بدقة مع فحص String و Bytes32
+async fn fetch_symbol<P: JsonRpcClient + 'static>(client: Arc<Provider<P>>, token_addr: Address) -> String {
+    let t_str = IERC20String::new(token_addr, client.clone());
+    if let Ok(sym) = t_str.symbol().call().await {
+        if !sym.is_empty() { return sym; }
+    }
+
+    let t_b32 = IERC20Bytes32::new(token_addr, client);
+    if let Ok(sym_b32) = t_b32.symbol().call().await {
+        let bytes: Vec<u8> = sym_b32.to_vec().into_iter().filter(|&b| b != 0).collect();
+        if let Ok(sym) = String::from_utf8(bytes) {
+            if !sym.trim().is_empty() { return sym.trim().to_string(); }
+        }
+    }
+
+    // إرجاع أول 6 أرقام من عنوان التوكن كبديل إذا فشلت قراءة الاسم
+    format!("0x{:x}..", &token_addr.as_bytes()[0..3])
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    println!("🚀 [Init]: بدء تشغيل محرك المراجحة المتقدم (50 Pools + Symbol Fetching)...");
+    println!("🚀 [Init]: بدء تشغيل محرك المراجحة المتقدم (Strict 50 Pools)...");
 
     let wss_url = std::env::var("QUICKNODE_WSS")
         .unwrap_or_else(|_| "wss://wiser-solemn-bird.base-mainnet.quiknode.pro/f470bcc04e93f882cddaa7f13a58a4672cde33bc".to_string());
@@ -82,22 +105,19 @@ async fn main() -> Result<()> {
     println!("📊 [Factory Summary]: إجمالي الأحواض المكتشفة: {}", total_pairs);
 
     let target_pool_count = 50;
-    println!("🔄 [Auto Fetch]: جاري جلب تفاصيل أحدث {} حوضاً واستخراج رموز التوكنات...", target_pool_count);
+    println!("🔄 [Auto Fetch]: جاري البحث للوراء لتجميع بالضبط {} حوضاً فعالاً...", target_pool_count);
 
     let mut pools_map: HashMap<Address, DynamicPool> = HashMap::new();
     let mut tracked_addresses: Vec<Address> = Vec::new();
 
-    let start_idx = if total_pairs > U256::from(target_pool_count) {
-        total_pairs - U256::from(target_pool_count)
-    } else {
-        U256::zero()
-    };
-
+    let mut current_idx = total_pairs;
     let mut pool_counter = 1;
-    let mut idx = start_idx;
 
-    while idx < total_pairs && pool_counter <= target_pool_count {
-        if let Ok(pair_address) = factory.all_pairs(idx).call().await {
+    // البحث للوراء حتى نصل بالضبط لـ 50 حوضاً فعالاً
+    while current_idx > U256::zero() && pool_counter <= target_pool_count {
+        current_idx -= U256::from(1);
+
+        if let Ok(pair_address) = factory.all_pairs(current_idx).call().await {
             let pair_contract = IUniswapV2Pair::new(pair_address, client.clone());
 
             if let (Ok(t0), Ok(t1), Ok((r0, r1, _))) = (
@@ -105,12 +125,11 @@ async fn main() -> Result<()> {
                 pair_contract.token_1().call().await,
                 pair_contract.get_reserves().call().await,
             ) {
-                // استخراج رموز التوكنات بمرونة (Fallback to ??? if fails)
-                let t0_contract = IERC20::new(t0, client.clone());
-                let t1_contract = IERC20::new(t1, client.clone());
-                
-                let sym0 = t0_contract.symbol().call().await.unwrap_or_else(|_| "???".to_string());
-                let sym1 = t1_contract.symbol().call().await.unwrap_or_else(|_| "???".to_string());
+                // تجنب الأحواض المعدومة السيولة
+                if r0 == 0 || r1 == 0 { continue; }
+
+                let sym0 = fetch_symbol(client.clone(), t0).await;
+                let sym1 = fetch_symbol(client.clone(), t1).await;
 
                 let pool_obj = DynamicPool {
                     id: pool_counter,
@@ -135,13 +154,11 @@ async fn main() -> Result<()> {
                 pool_counter += 1;
             }
         }
-        idx += U256::from(1);
 
-        // ⏱️ تأخير زمني ممتد لـ 200 مللي ثانية لأننا نقوم باستدعاء 4 دوال لكل حوض (لحماية الـ Rate Limit)
-        sleep(Duration::from_millis(200)).await;
+        sleep(Duration::from_millis(150)).await;
     }
 
-    println!("\n✅ [Setup Complete]: تم بناء الخريطة لـ {} أحواض وتحديد الرموز بنجاح!", pools_map.len());
+    println!("\n✅ [Setup Complete]: تم بناء الخريطة لـ {} أحواض فعالة وتحديد الرموز بنجاح!", pools_map.len());
 
     let filter = Filter::new()
         .event("Sync(uint112,uint112)")
@@ -166,7 +183,6 @@ async fn main() -> Result<()> {
                     exec_time_us, pool.token0_symbol, pool.token1_symbol, pool.reserve0, pool.reserve1
                 );
 
-                // 🧠 تشغيل المحاكاة متزامنة مع التحديث اللحظي للسيولة (تبدأ بـ 100 وحدة تقريبية للبحث)
                 run_dynamic_triangular_arbitrage(&pools_map, 100.0);
             }
         }
@@ -175,7 +191,6 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-// 🧠 محرك المحاكاة للمراجحة الديناميكية مع عرض رموز التوكنات
 fn run_dynamic_triangular_arbitrage(pools: &HashMap<Address, DynamicPool>, start_amount: f64) {
     let pools_vec: Vec<&DynamicPool> = pools.values().collect();
 
@@ -209,7 +224,6 @@ fn run_dynamic_triangular_arbitrage(pools: &HashMap<Address, DynamicPool>, start
 
                 let profit = final_amount - start_amount;
 
-                // إذا وجدنا أي مسار مربح بعد خصم الرسوم، يتم طباعته بالرموز
                 if profit > 0.0 {
                     println!(
                         "🎯 [Opportunity Found!]:\n   Path: {} -> {} -> {} -> {}\n   Input: {:.4} | Output: {:.4} | Net Profit: +{:.4}\n",
