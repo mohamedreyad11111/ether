@@ -1,10 +1,11 @@
 use ethers::prelude::*;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, Duration};
 use std::collections::HashMap;
+use tokio::time::sleep;
 use eyre::Result;
 
-// 1. تعريف واجهة Smart Contracts للـ Factory والـ Pair ديناميكياً
+// 1. واجهة الـ Factory والـ Pair الذكية
 abigen!(
     IUniswapV2Factory,
     r#"[
@@ -21,7 +22,7 @@ abigen!(
     ]"#;
 );
 
-// 2. هيكل بيانات الحوض المحدث في الـ Memory
+// 2. هيكل الحوض الديناميكي في الـ Memory
 #[derive(Debug, Clone)]
 struct DynamicPool {
     id: usize,
@@ -34,7 +35,7 @@ struct DynamicPool {
 }
 
 impl DynamicPool {
-    // محاكاة معادلة Constant Product Market Maker (x * y = k)
+    // محاكاة معادلة Constant Product (x * y = k)
     fn get_amount_out(&self, amount_in: f64, from_token0: bool) -> f64 {
         if amount_in <= 0.0 { return 0.0; }
         
@@ -54,7 +55,7 @@ impl DynamicPool {
     }
 }
 
-// عنوان Uniswap V2 / SwapBased Factory على شبكة Base Mainnet
+// عنوان Uniswap V2 / SwapBased Factory على Base Mainnet
 const UNISWAP_V2_FACTORY_BASE: &str = "0x8909Dc15e40173Ff4699343b6eB8132c65e18eC6";
 
 #[tokio::main]
@@ -70,7 +71,7 @@ async fn main() -> Result<()> {
     let factory_address: Address = UNISWAP_V2_FACTORY_BASE.parse()?;
     let factory = IUniswapV2Factory::new(factory_address, client.clone());
 
-    // 🔍 3. الاستعلام الديناميكي من الـ Factory مباشرة دون تخمين
+    // 🔍 الاستعلام الديناميكي من الـ Factory مباشرة
     println!("🔍 [Factory Query]: جاري الاستعلام عن إجمالي الأحواض المسجلة في Factory Base...");
     let total_pairs = factory.all_pairs_length().call().await?;
     println!("📊 [Factory Summary]: إجمالي الأحواض المكتشفة في الشبكة: {}", total_pairs);
@@ -81,7 +82,6 @@ async fn main() -> Result<()> {
     let mut pools_map: HashMap<Address, DynamicPool> = HashMap::new();
     let mut tracked_addresses: Vec<Address> = Vec::new();
 
-    // جلب أحدث 20 حوضاً من العقد الذكي مباشرة
     let start_idx = if total_pairs > U256::from(target_pool_count) {
         total_pairs - U256::from(target_pool_count)
     } else {
@@ -95,7 +95,6 @@ async fn main() -> Result<()> {
         if let Ok(pair_address) = factory.all_pairs(idx).call().await {
             let pair_contract = IUniswapV2Pair::new(pair_address, client.clone());
 
-            // جلب عناوين التوكنات والـ Reserves الأولية من البلوكشين
             if let (Ok(t0), Ok(t1), Ok((r0, r1, _))) = (
                 pair_contract.token_0().call().await,
                 pair_contract.token_1().call().await,
@@ -108,7 +107,7 @@ async fn main() -> Result<()> {
                     token1: t1,
                     reserve0: r0 as f64,
                     reserve1: r1 as f64,
-                    fee: 0.003, // 0.3% Fee
+                    fee: 0.003,
                 };
 
                 pools_map.insert(pair_address, pool_obj);
@@ -123,11 +122,14 @@ async fn main() -> Result<()> {
             }
         }
         idx += U256::from(1);
+
+        // ⏱️ تأخير 150ms لتجنب الـ Rate Limit في الخطة المجانية (15 RPS Limit)
+        sleep(Duration::from_millis(150)).await;
     }
 
     println!("\n✅ [Setup Complete]: تم بناء الخريطة لـ {} أحواض حقيقية بنجاح!", pools_map.len());
 
-    // ⚡ 4. إعداد الـ Filter بجميع العناوين الديناميكية المكتشفة
+    // ⚡ إعداد الـ WSS Filter
     let filter = Filter::new()
         .event("Sync(uint112,uint112)")
         .address(tracked_addresses);
@@ -140,7 +142,6 @@ async fn main() -> Result<()> {
         let start_time = Instant::now();
 
         if let Some(pool) = pools_map.get_mut(&log.address) {
-            // فك التشفير الدقيق الصارم للـ Log
             if let Ok(sync_event) = <SyncFilter as EthEvent>::decode_log(&log.clone().into()) {
                 pool.reserve0 = sync_event.reserve_0 as f64;
                 pool.reserve1 = sync_event.reserve_1 as f64;
@@ -152,7 +153,7 @@ async fn main() -> Result<()> {
                     latency_us, pool.id, pool.address, pool.reserve0, pool.reserve1
                 );
 
-                // 🧠 5. تشغيل محاكاة المراجحة الديناميكية بين الأحواض المستكشفة
+                // 🧠 تشغيل المحاكاة
                 run_dynamic_triangular_arbitrage(&pools_map, 1.0);
             }
         }
@@ -161,7 +162,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-// 🧠 6. محرك البحث والمحاكاة الديناميكية للمراجحة بين الأحواض المستوردة
+// 🧠 محرك المحاكاة للمراجحة الديناميكية
 fn run_dynamic_triangular_arbitrage(pools: &HashMap<Address, DynamicPool>, start_amount: f64) {
     let pools_vec: Vec<&DynamicPool> = pools.values().collect();
 
@@ -195,7 +196,7 @@ fn run_dynamic_triangular_arbitrage(pools: &HashMap<Address, DynamicPool>, start
 
                 if profit > 0.0 {
                     println!(
-                        "🎯 [Dynamic Arbitrage Opportunity Found!]:\n   Path: {:?} -> {:?} -> {:?} -> {:?}\n   Input: {:.4} | Expected Output: {:.4} | Profit: +{:.4}\n",
+                        "🎯 [Opportunity Found!]:\n   Path: {:?} -> {:?} -> {:?} -> {:?}\n   Input: {:.4} | Output: {:.4} | Profit: +{:.4}\n",
                         start_token, t1_out, t2_out, start_token,
                         start_amount, final_amount, profit
                     );
