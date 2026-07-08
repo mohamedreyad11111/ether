@@ -1,0 +1,38 @@
+name: Rust DEX WSS Price Monitor Test
+
+on:
+  workflow_dispatch: # يتيح لك تشغيل الاختبار يدوياً بضغطة زر
+  push:
+    branches: [ main ]
+
+jobs:
+  run-monitor:
+    runs-on: ubuntu-latest
+    # ضبط الحد الأقصى للتشغيل (مثلاً ساعة واحدة للاختبار أو حتى 360 دقيقة للحد الأقصى)
+    timeout-minutes: 60 
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo Dependencies
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Run DEX Monitor Tool
+        env:
+          # نمرر رابط QuickNode WSS عبر البيئة
+          QUICKNODE_WSS: "wss://wiser-solemn-bird.base-mainnet.quiknode.pro/f470bcc04e93f882cddaa7f13a58a4672cde33bc"
+        run: |
+          echo " Starting Rust WebSocket Monitor Process..."
+          cargo run --release
