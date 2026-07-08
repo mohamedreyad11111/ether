@@ -1,0 +1,10 @@
+[package]
+name = "dex_price_monitor"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1.38", features = ["full"] }
+ethers = { version = "2.0", features = ["ws"] }
+eyre = "0.6"
+futures-util = "0.3"
