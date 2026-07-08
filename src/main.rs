@@ -35,7 +35,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let start_total_time = Instant::now();
 
     while total_requests < total_target_requests {
-        // الانتظار بالضبط حتى يحين وقت الطلب القادم
+        // الانتظار حتى يحين وقت الطلب القادم
         ticker.tick().await;
 
         total_requests += 1;
@@ -58,8 +58,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         latencies_ms.push(latency);
                         success_count += 1;
 
-                        // استخراج السعر المرتجع لـ 1 WETH
-                        if let Ok(json): Result<Value, _> = serde_json::from_str(&body_text) {
+                        // استخراج السعر المرتجع لـ 1 WETH باستخدام Turbofish syntax ::<Value>
+                        if let Ok(json) = serde_json::from_str::<Value>(&body_text) {
                             let buy_amount = json["buyAmount"].as_str().unwrap_or("0");
                             let buy_usdc = buy_amount.parse::<f64>().unwrap_or(0.0) / 1_000_000.0;
 
