@@ -34,13 +34,15 @@ async fn main() -> Result<()> {
     let mut stream = client.subscribe_logs(&filter).await?;
 
     while let Some(log) = stream.next().await {
-        // فك التشفير الدقيق لتفادي غموض الـ Trait
-        if let Ok(sync_event) = <SyncFilter as EthEvent>::decode_log(&log.into()) {
+        // نحدد اسم الحوض أولاً حفظاً للـ Ownership
+        let pool_name = if log.address == pool_a_addr { "DEX Pool A" } else { "DEX Pool B" };
+
+        // التعديل هنا: استخدام clone().into() حتى لا يتم استهلاك log بالكامل
+        if let Ok(sync_event) = <SyncFilter as EthEvent>::decode_log(&log.clone().into()) {
             let r0 = sync_event.reserve_0 as f64;
             let r1 = sync_event.reserve_1 as f64;
             
             let price = if r0 > 0.0 { r1 / r0 } else { 0.0 };
-            let pool_name = if log.address == pool_a_addr { "DEX Pool A" } else { "DEX Pool B" };
 
             println!(
                 "⚡ [تحديث سعر]: {} | Reserve0: {:.2} | Reserve1: {:.2} | السعر: {:.6}",
